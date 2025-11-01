@@ -124,9 +124,9 @@ function detectUnsafeTypes(content: string): string[] {
   const anyPattern = /:\s*any\b/g;
   const unknownPattern = /:\s*unknown\b/g;
 
-  if (anyPattern.test(content)) issues.push('Uso de tipo "any" detectado');
+  if (anyPattern.test(content)) issues.push('"any" type usage detected');
   if (unknownPattern.test(content))
-    issues.push('Uso de tipo "unknown" detectado');
+    issues.push('Use of type "unknown" detected');
 
   return issues;
 }

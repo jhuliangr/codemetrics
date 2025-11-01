@@ -2,14 +2,11 @@
   "name": "codemetrics-cli",
   "version": "0.0.1",
   "description": "CLI tool for code metrics analysis",
-  "bin": {
-    "codemetrics": "./bin/cli.js"
-  },
   "scripts": {
+    "analyze": "ts-node src/main.ts analyze",
     "build": "tsc",
-    "start": "node dist/index.js",
-    "dev": "ts-node src/index.ts",
-    "prepublishOnly": "npm run build"
+    "dev": "ts-node src/main.ts",
+    "prepublishOnly": "pnpm build"
   },
   "keywords": [
     "cli",
