@@ -6,7 +6,8 @@
     "analyze": "ts-node src/main.ts analyze",
     "build": "tsc",
     "dev": "ts-node src/main.ts",
-    "prepublishOnly": "pnpm build"
+    "prepublishOnly": "pnpm build",
+    "start": "node dist/main.js"
   },
   "keywords": [
     "cli",
