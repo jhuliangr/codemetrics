@@ -59,5 +59,10 @@ function displayTableResults(results: CodeMetrics[]) {
         result.typeIssues.length === 0 ? '0' : result.typeIssues.join(', ')
       }`,
     );
+    console.log(
+      `  Dead code: ${
+        result.deadCode.length === 0 ? '0' : result.deadCode.join(', ')
+      }`,
+    );
   });
 }

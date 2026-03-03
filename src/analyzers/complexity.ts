@@ -1,6 +1,15 @@
 import { CodeMetrics, AnalysisOptions } from '../types';
 import * as fs from 'fs';
 import * as path from 'path';
+import { Project, SyntaxKind, ts } from 'ts-morph';
+
+const project = new Project({
+  useInMemoryFileSystem: true,
+  compilerOptions: {
+    allowJs: true,
+    checkJs: true,
+  },
+});
 
 export async function analyzeCodebase(
   basePath: string,
@@ -45,11 +54,19 @@ function shouldExclude(filePath: string, patterns: string[]): boolean {
 
 async function analyzeFile(filePath: string): Promise<CodeMetrics> {
   const content = await fs.promises.readFile(filePath, 'utf-8');
-  const lines = content.split('\n');
   const isTS = filePath.endsWith('.ts') || filePath.endsWith('.tsx');
-  const unusedVars = findUnusedVariables(content);
-  const unusedImports = findUnusedImports(content);
-  const typeIssues = isTS ? detectUnsafeTypes(content) : [];
+
+  const sourceFile = project.createSourceFile(filePath, content, {
+    overwrite: true,
+  });
+
+  const lines = content.split('\n');
+  const unusedVars = isTS
+    ? findUnusedVariablesAST(sourceFile)
+    : findUnusedVariablesRegex(content);
+  const unusedImports = findUnusedImportsAST(sourceFile);
+  const typeIssues = isTS ? detectUnsafeTypesAST(sourceFile) : [];
+  const deadCode = findDeadCodeAST(sourceFile);
 
   return {
     filePath,
@@ -59,9 +76,9 @@ async function analyzeFile(filePath: string): Promise<CodeMetrics> {
       comment: countCommentLines(lines),
       blank: countBlankLines(lines),
     },
-    complexity: calculateComplexity(content),
-    functions: countFunctions(content),
-    classes: countClasses(content),
+    complexity: calculateComplexityAST(sourceFile),
+    functions: countFunctionsAST(sourceFile),
+    classes: countClassesAST(sourceFile),
     duplication: {
       percentage: calculateDuplication(content),
       duplicatedLines: 0,
@@ -69,10 +86,39 @@ async function analyzeFile(filePath: string): Promise<CodeMetrics> {
     unusedVariables: unusedVars,
     unusedImports,
     typeIssues,
+    deadCode,
   };
 }
 
-function findUnusedVariables(content: string): string[] {
+function findUnusedVariablesAST(sourceFile: any): string[] {
+  const declaredVars = new Map<string, number>();
+  const usedVars = new Set<string>();
+
+  sourceFile.forEachDescendant((node: any) => {
+    if (node.getKind() === SyntaxKind.VariableDeclaration) {
+      const nameNode = node.getNameNode();
+      const name = nameNode?.getText();
+      if (name && typeof name === 'string') {
+        declaredVars.set(name, (declaredVars.get(name) || 0) + 1);
+      }
+    }
+
+    if (node.getKind() === SyntaxKind.Identifier) {
+      usedVars.add(node.getText());
+    }
+  });
+
+  const unused: string[] = [];
+  declaredVars.forEach((count, varName) => {
+    if (!usedVars.has(varName)) {
+      unused.push(varName);
+    }
+  });
+
+  return unused;
+}
+
+function findUnusedVariablesRegex(content: string): string[] {
   const varPattern = /\b(?:const|let|var)\s+([a-zA-Z_$][\w$]*)/g;
   const declaredVars = new Set<string>();
   let match;
@@ -93,42 +139,135 @@ function findUnusedVariables(content: string): string[] {
   return unused;
 }
 
-function findUnusedImports(content: string): string[] {
-  const importPattern = /import\s+([^'";]+)\s+from\s+['"][^'"]+['"]/g;
-  const importedNames: string[] = [];
-  let match;
+function findUnusedImportsAST(sourceFile: any): string[] {
+  const importedNames = new Map<string, string>();
+  const usedNames = new Set<string>();
 
-  while ((match = importPattern.exec(content)) !== null) {
-    const clause = match[1]
-      .replace(/{|}|\* as/g, '')
-      .split(',')
-      .map((v) => v.trim())
-      .filter(Boolean);
-    importedNames.push(...clause);
+  const importDeclarations = sourceFile.getImportDeclarations();
+  const importRanges: any[] = [];
+
+  for (const importDecl of importDeclarations) {
+    const moduleName = importDecl.getModuleSpecifier().getText();
+    importRanges.push({
+      start: importDecl.getStart(),
+      end: importDecl.getEnd(),
+    });
+
+    const namedImports = importDecl.getNamedImports();
+
+    for (const namedImport of namedImports) {
+      const name = namedImport.getName();
+      importedNames.set(name, moduleName);
+    }
+
+    const defaultImport = importDecl.getDefaultImport();
+    if (defaultImport && typeof defaultImport.getName === 'function') {
+      importedNames.set(defaultImport.getName(), moduleName);
+    }
+
+    const namespaceImport = importDecl.getNamespaceImport();
+    if (namespaceImport && typeof namespaceImport.getName === 'function') {
+      importedNames.set(namespaceImport.getName(), moduleName);
+    }
   }
 
-  const allIdentifiers = Array.from(
-    content.matchAll(/\b[a-zA-Z_$][\w$]*\b/g),
-  ).map((m) => m[0]);
+  sourceFile.forEachDescendant((node: any) => {
+    if (node.getKind() === SyntaxKind.Identifier) {
+      const text = node.getText();
+      const start = node.getStart();
+      const end = node.getEnd();
 
-  const unused = importedNames.filter((name) => {
-    const occurrences = allIdentifiers.filter((id) => id === name).length;
-    return occurrences <= 1;
+      const isInImport = importRanges.some(
+        (r) => start >= r.start && end <= r.end,
+      );
+
+      if (!isInImport && text) {
+        usedNames.add(text);
+      }
+    }
+  });
+
+  sourceFile.forEachDescendant((node: any) => {
+    if (
+      node.getKind() === SyntaxKind.TypeReference ||
+      node.getKind() === SyntaxKind.TypeAliasDeclaration ||
+      node.getKind() === SyntaxKind.InterfaceDeclaration ||
+      node.getKind() === SyntaxKind.ClassDeclaration
+    ) {
+      const typeName = node.getNameNode?.()?.getText() || node.getName?.();
+      if (typeName) {
+        usedNames.add(typeName);
+      }
+    }
+  });
+
+  const unused: string[] = [];
+  importedNames.forEach((module, name) => {
+    if (!usedNames.has(name)) {
+      unused.push(name);
+    }
   });
 
   return unused;
 }
 
-function detectUnsafeTypes(content: string): string[] {
+function detectUnsafeTypesAST(sourceFile: any): string[] {
   const issues: string[] = [];
-  const anyPattern = /:\s*any\b/g;
-  const unknownPattern = /:\s*unknown\b/g;
 
-  if (anyPattern.test(content)) issues.push('"any" type usage detected');
-  if (unknownPattern.test(content))
-    issues.push('Use of type "unknown" detected');
+  sourceFile.forEachDescendant((node: any) => {
+    if (
+      node.getKind() === SyntaxKind.TypeReference ||
+      node.getKind() === SyntaxKind.TupleType
+    ) {
+      const typeNode = node.getType();
+      if (typeNode) {
+        const typeText = typeNode.getText();
+        if (typeText === 'any') {
+          issues.push('"any" type usage detected');
+        } else if (typeText === 'unknown') {
+          issues.push('Use of type "unknown" detected');
+        }
+      }
+    }
+  });
 
-  return issues;
+  return [...new Set(issues)];
+}
+
+function findDeadCodeAST(sourceFile: any): string[] {
+  const deadCode: string[] = [];
+
+  const functions = sourceFile.getFunctions();
+  for (const func of functions) {
+    const name = func.getName();
+    const isExported = func
+      .getModifiers()
+      ?.some((m: any) => m.getKind() === SyntaxKind.ExportKeyword);
+
+    if (name && !isExported) {
+      const refs = func.findReferencesAsNodes();
+      if (refs.length <= 1) {
+        deadCode.push(`Unused function: ${name}`);
+      }
+    }
+  }
+
+  const classes = sourceFile.getClasses();
+  for (const cls of classes) {
+    const name = cls.getName();
+    const isExported = cls
+      .getModifiers()
+      ?.some((m: any) => m.getKind() === SyntaxKind.ExportKeyword);
+
+    if (name && !isExported) {
+      const refs = cls.findReferencesAsNodes();
+      if (refs.length <= 1) {
+        deadCode.push(`Unused class: ${name}`);
+      }
+    }
+  }
+
+  return deadCode;
 }
 
 function countCodeLines(lines: string[]): number {
@@ -156,39 +295,42 @@ function countBlankLines(lines: string[]): number {
   return lines.filter((line) => line.trim().length === 0).length;
 }
 
-function calculateComplexity(content: string): number {
-  const complexityPatterns = [
-    /\bif\s*\(/g,
-    /\bfor\s*\(/g,
-    /\bwhile\s*\(/g,
-    /\bcase\s+/g,
-    /\bcatch\s*\(/g,
-    /\b&&/g,
-    /\b\|\|/g,
-  ];
+function calculateComplexityAST(sourceFile: any): number {
+  let count = 1;
 
-  return complexityPatterns.reduce((count, pattern) => {
-    const matches = content.match(pattern);
-    return count + (matches ? matches.length : 0);
-  }, 1);
+  sourceFile.forEachDescendant((node: any) => {
+    const kind = node.getKind();
+    if (
+      kind === SyntaxKind.IfStatement ||
+      kind === SyntaxKind.ForStatement ||
+      kind === SyntaxKind.WhileStatement ||
+      kind === SyntaxKind.CaseClause ||
+      kind === SyntaxKind.CatchClause ||
+      kind === SyntaxKind.BinaryExpression
+    ) {
+      count++;
+    }
+  });
+
+  return count;
 }
 
-function countFunctions(content: string): number {
-  const functionPatterns = [
-    /\bfunction\s+(\w+)\s*\(/g,
-    /const\s+(\w+)\s*=\s*\([^)]*\)\s*=>/g,
-    /let\s+(\w+)\s*=\s*\([^)]*\)\s*=>/g,
-    /(\w+)\s*\([^)]*\)\s*\{/g,
-  ];
+function countFunctionsAST(sourceFile: any): number {
+  let count = 0;
 
-  return functionPatterns.reduce((count, pattern) => {
-    const matches = content.match(pattern);
-    return count + (matches ? matches.length : 0);
-  }, 0);
+  sourceFile.getFunctions().forEach(() => count++);
+
+  sourceFile.forEachDescendant((node: any) => {
+    if (node.getKind() === SyntaxKind.ArrowFunction) {
+      count++;
+    }
+  });
+
+  return count;
 }
 
-function countClasses(content: string): number {
-  return (content.match(/\bclass\s+(\w+)/g) || []).length;
+function countClassesAST(sourceFile: any): number {
+  return sourceFile.getClasses().length;
 }
 
 function calculateDuplication(content: string): number {

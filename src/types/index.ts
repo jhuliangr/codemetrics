@@ -16,6 +16,7 @@ export interface CodeMetrics {
   unusedVariables: string[];
   unusedImports: string[];
   typeIssues: string[];
+  deadCode: string[];
 }
 
 export interface RawAnalysisOptions {
